@@ -21,7 +21,7 @@ The sketch is written in Arduino C++, which is C++ compiled for the UNO. It uses
 | --- | --- |
 | Ultrasonic sensor VCC / GND | 5V / GND |
 | Ultrasonic sensor TRIG / ECHO | D2 / D3 |
-| Servo signal / power / ground | A1 / 5V / GND |
+| Servo signal / power / ground | A1 / separate regulated 5V / common GND |
 | Green LED anode through resistor / cathode | D4 / GND |
 | Red LED anode through resistor / cathode | D5 / GND |
 | Active buzzer + / − | D6 / GND |
@@ -31,20 +31,20 @@ The sketch is written in Arduino C++, which is C++ compiled for the UNO. It uses
 | LCD1602 RW | GND |
 | LCD1602 LED A / K | 5V through a suitable resistor / GND (check module) |
 
-Use a 10 kΩ potentiometer across 5V and GND for LCD contrast, with its wiper connected to VO. Connect every component's ground to UNO GND. One small SG90 servo can usually be tested from the UNO's 5V pin. If the UNO resets, the LCD flickers, or the servo shakes, power the servo from a separate regulated 5V supply and connect that supply's GND to Arduino GND.
+Use a 10 kΩ potentiometer across 5V and GND for LCD contrast, with its wiper connected to VO. Connect every component's ground to UNO GND. Power the servo from a separate regulated 5V supply rated for at least 1 A, and connect that supply's GND to Arduino GND. Add a 470–1000 µF capacitor across that servo supply near the servo. The UNO 5V pin often cannot provide enough current for a servo plus the LCD, sensor, LEDs, and buzzer; that causes missed movement, resets, dim LCD text, or shaky scans.
 
 ## Upload and try it
 
 1. Wire the circuit with USB disconnected.
 2. Open `Guardian.ino` in the Arduino IDE, select **Arduino UNO**, choose its serial port, and upload.
-3. Open **Tools → Serial Monitor** and set the baud rate to **9600**.
-4. Keep the radar area empty during startup. The servo sweeps from side to side while the LCD says `Clear area now`; calibration takes a few seconds.
-5. After calibration, the sensor repeatedly sweeps from 20° to 160°. Move your hand into its path. The buzzer repeats while the zone is occupied (200 ms on, 300 ms off), even if your hand stays still. Move your hand out; after two clear sweeps it returns to `RADAR CLEAR` and green.
-6. Point the remote at the IR receiver and briefly tap **POWER** to enter `SYSTEM OFF`: scanning, LEDs, and buzzer stop, but the IR receiver remains ready. Tap **POWER** again to resume monitoring. Press **0** to reset the Guardian software and repeat its empty-area calibration. Press **1** to mute the buzzer while the sensor, LEDs, LCD, and phone dashboard continue working. Reset or turn the system off and back on to restore sound.
+3. Open **Tools → Serial Monitor** and set the baud rate to **115200**.
+4. Keep the radar area empty during startup. The servo moves through 15 positions and saves the distance at each one; calibration takes about 15 seconds. The LCD shows the slot number and angle.
+5. After calibration, the sensor repeatedly sweeps from 20° to 160°. Move your hand into its path. The buzzer repeats while the zone is occupied (200 ms on, 300 ms off), even if your hand stays still. Move your hand out; after one clear sweep pass it returns to `RADAR CLEAR` and green.
+6. Point the remote at the IR receiver and briefly tap **POWER** to enter `SYSTEM OFF`: scanning, LEDs, and buzzer stop, but the IR receiver remains ready. Tap **POWER** again to recalibrate and resume monitoring. Press **0** to reset the Guardian software and repeat its empty-area calibration. Calibration now runs in small steps so the main loop can continue reading the remote. Press **1** to mute the buzzer while the sensor, LEDs, LCD, and phone dashboard continue working. Reset or turn the system off and back on to restore sound.
 
 The sketch uses the legacy `IRremote.h` API and is written for IRremote 2.6.0. The expected raw codes are POWER `0xFFA25D`, 0 `0xFF6897`, and 1 `0xFF30CF`. The Serial Monitor prints every received code, so replace these constants in `Guardian.ino` if your remote reports different values. The IR receiver module in the Elegoo lesson labels its pins G (ground), Y (signal), and R (3.3V); follow your module's labels if its layout differs.
 
-The radar ignores readings beyond 4 m and stores a separate baseline distance at every 10° scan position. For this long-range test, an object must appear about 8 cm closer than the saved background at that position to count as entering. If the sensor saw no background echo at an angle, any later valid echo inside 4 m counts as an object. The system clears only after two full scans find no intrusion. If the area is not empty during startup, the saved background will be wrong. This is a simple front-facing scan, not a camera image; it detects objects, not people.
+The sensor reads up to 4 m, but the protected zone is set to 2 m. During calibration the radar saves a separate background distance in each of its 15 scan positions. It waits for the servo to reach each angle, takes five readings with at least 60 ms between pings, discards the highest and lowest, and averages the rest to reduce false echoes. During normal scanning it takes three readings and uses their middle value. An object inside 2 m must appear at least 8 cm closer than the saved background at that position to count as entering. Positions that had no echo during calibration are ignored to prevent random echoes from causing false alarms. The saved distances stay in memory until the Arduino is reset or powered off, so recalibrate with the area empty after startup. The system clears after one complete sweep pass finds no intrusion; a new detection keeps it occupied. If the area is not empty during calibration, the saved background will be wrong. This is a simple front-facing scan, not a camera image; it detects objects, not people.
 
 ## Phone dashboard through the laptop
 

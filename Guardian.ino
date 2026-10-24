@@ -16,13 +16,20 @@ constexpr byte LCD_D7_PIN = 12;
 constexpr byte IR_RECEIVE_PIN = A0;
 constexpr byte SERVO_PIN = A1;
 
+constexpr unsigned long SERIAL_BAUD_RATE = 115200;
 constexpr unsigned long REMOTE_POWER_CODE = 0xFFA25DUL;
 constexpr unsigned long REMOTE_ZERO_CODE = 0xFF6897UL;
 constexpr unsigned long REMOTE_ONE_CODE = 0xFF30CFUL;
-constexpr float MAX_ALERT_DISTANCE_CM = 400.0;
+constexpr float SENSOR_MAX_DISTANCE_CM = 400.0;
+constexpr float PROTECTED_ZONE_DISTANCE_CM = 200.0;
 constexpr float ENTRY_MARGIN_CM = 8.0;
-constexpr unsigned long ECHO_TIMEOUT_US = 25000;
-constexpr unsigned long SCAN_SETTLE_MS = 75;
+constexpr float MIN_VALID_DISTANCE_CM = 2.0;
+constexpr unsigned long ECHO_TIMEOUT_US = 26000;
+constexpr unsigned long SERVO_SETTLE_MS = 800;
+constexpr unsigned long CALIBRATION_SETTLE_MS = 800;
+constexpr unsigned long BETWEEN_SENSOR_READINGS_MS = 60;
+constexpr int SERVO_MIN_PULSE_US = 1000;
+constexpr int SERVO_MAX_PULSE_US = 2000;
 constexpr unsigned long BUZZER_ON_MS = 200;
 constexpr unsigned long BUZZER_OFF_MS = 300;
 constexpr byte SCAN_MIN_ANGLE = 20;
@@ -30,8 +37,9 @@ constexpr byte SCAN_MAX_ANGLE = 160;
 constexpr byte SCAN_STEP_ANGLE = 10;
 constexpr byte SCAN_POINT_COUNT =
     ((SCAN_MAX_ANGLE - SCAN_MIN_ANGLE) / SCAN_STEP_ANGLE) + 1;
-constexpr byte CALIBRATION_READINGS = 3;
-constexpr byte REQUIRED_CLEAR_SWEEPS = 2;
+constexpr byte READINGS_PER_ANGLE = 3;
+constexpr byte CALIBRATION_READINGS = 5;
+constexpr byte REQUIRED_CLEAR_SWEEPS = 1;
 
 LiquidCrystal lcd(LCD_RS_PIN, LCD_ENABLE_PIN, LCD_D4_PIN, LCD_D5_PIN,
                   LCD_D6_PIN, LCD_D7_PIN);
@@ -44,23 +52,28 @@ bool zoneOccupied = false;
 bool presenceLatched = false;
 bool sweepHasIntrusion = false;
 bool soundEnabled = true;
+bool calibrationActive = false;
 bool baselineHasEcho[SCAN_POINT_COUNT] = {};
 float baselineDistanceCm[SCAN_POINT_COUNT] = {};
 byte clearSweepCount = 0;
 byte scanIndex = 0;
+byte calibrationIndex = 0;
 int8_t scanDirection = 1;
 bool buzzerOn = false;
 bool statusDisplayInitialized = false;
 bool displayedSystemPoweredOn = true;
 bool displayedZoneOccupied = false;
-unsigned long lastScanReadMs = 0;
+unsigned long lastServoCommandMs = 0;
+unsigned long calibrationServoCommandMs = 0;
 unsigned long buzzerChangeAtMs = 0;
+
+void updateZone();
 
 byte scanAngle(byte index) {
   return SCAN_MIN_ANGLE + index * SCAN_STEP_ANGLE;
 }
 
-float measureDistanceCm() {
+float measureDistanceOnceCm() {
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH);
@@ -71,7 +84,58 @@ float measureDistanceCm() {
   if (echoDurationUs == 0) {
     return -1.0;
   }
-  return echoDurationUs * 0.0343 / 2.0;
+  const float distanceCm = echoDurationUs * 0.0343 / 2.0;
+  if (distanceCm < MIN_VALID_DISTANCE_CM ||
+      distanceCm > SENSOR_MAX_DISTANCE_CM) {
+    return -1.0;
+  }
+  return distanceCm;
+}
+
+float measureFilteredDistanceCm(byte readingsToTake) {
+  float validDistances[CALIBRATION_READINGS] = {};
+  byte validReadingCount = 0;
+
+  for (byte readingIndex = 0; readingIndex < readingsToTake; ++readingIndex) {
+    const float distanceCm = measureDistanceOnceCm();
+    if (distanceCm >= 0.0) {
+      validDistances[validReadingCount] = distanceCm;
+      ++validReadingCount;
+    }
+    if (readingIndex + 1 < readingsToTake) {
+      delay(BETWEEN_SENSOR_READINGS_MS);
+    }
+  }
+
+  if (validReadingCount == 0) {
+    return -1.0;
+  }
+
+  for (byte currentIndex = 1; currentIndex < validReadingCount;
+       ++currentIndex) {
+    const float selectedDistance = validDistances[currentIndex];
+    byte insertIndex = currentIndex;
+    while (insertIndex > 0 &&
+           validDistances[insertIndex - 1] > selectedDistance) {
+      validDistances[insertIndex] = validDistances[insertIndex - 1];
+      --insertIndex;
+    }
+    validDistances[insertIndex] = selectedDistance;
+  }
+
+  if (validReadingCount < 3) {
+    if (validReadingCount == 1) {
+      return validDistances[0];
+    }
+    return (validDistances[0] + validDistances[1]) / 2.0;
+  }
+
+  float trimmedDistanceSum = 0.0;
+  for (byte currentIndex = 1; currentIndex + 1 < validReadingCount;
+       ++currentIndex) {
+    trimmedDistanceSum += validDistances[currentIndex];
+  }
+  return trimmedDistanceSum / (validReadingCount - 2);
 }
 
 void showDistance(float distanceCm) {
@@ -105,54 +169,85 @@ void showStatus() {
   }
 }
 
-void calibrateRadar() {
+void startCalibration() {
+  calibrationActive = true;
+  calibrationIndex = 0;
+  scanIndex = 0;
+  scanDirection = 1;
+  presenceLatched = false;
+  sweepHasIntrusion = false;
+  clearSweepCount = 0;
+  buzzerOn = false;
+  digitalWrite(BUZZER_PIN, LOW);
+
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("Clear area now");
-  Serial.println("Keep radar area empty: calibrating...");
+  lcd.print("Calibrating...");
+  Serial.println("Keep radar area empty: calibrating 15 positions");
 
-  for (byte index = 0; index < SCAN_POINT_COUNT; ++index) {
-    radarServo.write(scanAngle(index));
-    delay(180);
-    float totalDistanceCm = 0.0;
-    byte validReadings = 0;
-    for (byte reading = 0; reading < CALIBRATION_READINGS; ++reading) {
-      const float distanceCm = measureDistanceCm();
-      if (distanceCm >= 0.0) {
-        totalDistanceCm += distanceCm;
-        ++validReadings;
-      }
-      delay(35);
-    }
-    baselineHasEcho[index] = validReadings > 0;
-    baselineDistanceCm[index] = baselineHasEcho[index]
-        ? totalDistanceCm / validReadings : -1.0;
+  radarServo.write(scanAngle(0));
+  calibrationServoCommandMs = millis();
+}
 
-    lcd.setCursor(0, 1);
-    lcd.print("Scan ");
-    lcd.print(index + 1);
-    lcd.print("/");
-    lcd.print(SCAN_POINT_COUNT);
-    lcd.print("       ");
+void updateCalibration(unsigned long nowMs) {
+  if (!calibrationActive ||
+      nowMs - calibrationServoCommandMs < CALIBRATION_SETTLE_MS) {
+    return;
   }
 
+  const byte angle = scanAngle(calibrationIndex);
+  const float distanceCm = measureFilteredDistanceCm(CALIBRATION_READINGS);
+  baselineHasEcho[calibrationIndex] = distanceCm >= 0.0;
+  baselineDistanceCm[calibrationIndex] = distanceCm;
+
+  lcd.setCursor(0, 1);
+  lcd.print("Slot ");
+  lcd.print(calibrationIndex + 1);
+  lcd.print("/");
+  lcd.print(SCAN_POINT_COUNT);
+  lcd.print(" ");
+  lcd.print(angle);
+  lcd.print(" deg  ");
+
+  Serial.print("Calibration slot ");
+  Serial.print(calibrationIndex + 1);
+  Serial.print("/15 | Angle: ");
+  Serial.print(angle);
+  Serial.print(" | Saved distance: ");
+  if (baselineHasEcho[calibrationIndex]) {
+    Serial.print(baselineDistanceCm[calibrationIndex], 1);
+    Serial.println(" cm");
+  } else {
+    Serial.println("no echo; this angle will be ignored");
+  }
+
+  ++calibrationIndex;
+  if (calibrationIndex < SCAN_POINT_COUNT) {
+    radarServo.write(scanAngle(calibrationIndex));
+    calibrationServoCommandMs = millis();
+    return;
+  }
+
+  calibrationActive = false;
   scanIndex = 0;
   scanDirection = 1;
   radarServo.write(scanAngle(scanIndex));
+  lastServoCommandMs = millis();
+  Serial.println("Calibration complete; radar scanning");
   lcd.clear();
+  statusDisplayInitialized = false;
+  updateZone();
 }
 
 bool readingShowsIntrusion(byte index, float distanceCm) {
-  if (distanceCm < 0.0 || distanceCm > MAX_ALERT_DISTANCE_CM) {
+  if (distanceCm < 0.0 || distanceCm > PROTECTED_ZONE_DISTANCE_CM) {
     return false;
   }
   if (!baselineHasEcho[index]) {
-    return true;
+    return false;
   }
   return distanceCm <= baselineDistanceCm[index] - ENTRY_MARGIN_CM;
 }
-
-void updateZone();
 
 void updatePresence(byte index, float distanceCm) {
   if (readingShowsIntrusion(index, distanceCm)) {
@@ -176,15 +271,9 @@ void resetGuardian() {
   systemPoweredOn = true;
   soundEnabled = true;
   zoneOccupied = false;
-  presenceLatched = false;
-  sweepHasIntrusion = false;
-  clearSweepCount = 0;
-  buzzerOn = false;
-  digitalWrite(BUZZER_PIN, LOW);
   statusDisplayInitialized = false;
   Serial.println("SYSTEM RESET: calibrating radar");
-  calibrateRadar();
-  updateZone();
+  startCalibration();
 }
 
 void updateZone() {
@@ -255,6 +344,7 @@ void advanceScan() {
   }
   scanIndex += scanDirection;
   radarServo.write(scanAngle(scanIndex));
+  lastServoCommandMs = millis();
 }
 
 void setup() {
@@ -264,34 +354,35 @@ void setup() {
   pinMode(RED_LED_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
 
-  Serial.begin(9600);
+  Serial.begin(SERIAL_BAUD_RATE);
   lcd.begin(16, 2);
   irReceiver.enableIRIn();
-  radarServo.attach(SERVO_PIN);
+  radarServo.attach(SERVO_PIN, SERVO_MIN_PULSE_US, SERVO_MAX_PULSE_US);
   delay(300);
-  calibrateRadar();
-  updateZone();
+  startCalibration();
 
   Serial.println("Guardian radar monitor");
-  Serial.println("Servo signal: A1; keep area empty during calibration");
+  Serial.println("Serial speed: 115200 baud");
+  Serial.println("Servo signal: A1; pulse range 1000-2000 us");
+  Serial.println("Keep area empty during calibration");
   Serial.println("Remote POWER: software off/on | 0: reset | 1: mute buzzer");
 }
 
 void loop() {
-  const unsigned long nowMs = millis();
-
   if (irReceiver.decode(&irResults)) {
     Serial.print("IR code: 0x");
     Serial.println(irResults.value, HEX);
     if (irResults.value == REMOTE_POWER_CODE) {
       systemPoweredOn = !systemPoweredOn;
       if (!systemPoweredOn) {
+        calibrationActive = false;
         presenceLatched = false;
         sweepHasIntrusion = false;
         clearSweepCount = 0;
         soundEnabled = false;
       } else {
         soundEnabled = true;
+        startCalibration();
       }
       Serial.println(systemPoweredOn ? "SYSTEM ON" : "SYSTEM OFF");
       updateZone();
@@ -306,10 +397,13 @@ void loop() {
     irReceiver.resume();
   }
 
-  if (systemPoweredOn && nowMs - lastScanReadMs >= SCAN_SETTLE_MS) {
-    lastScanReadMs = nowMs;
+  const unsigned long nowMs = millis();
+  if (systemPoweredOn && calibrationActive) {
+    updateCalibration(nowMs);
+  } else if (systemPoweredOn &&
+             nowMs - lastServoCommandMs >= SERVO_SETTLE_MS) {
     const byte angle = scanAngle(scanIndex);
-    const float distanceCm = measureDistanceCm();
+    const float distanceCm = measureFilteredDistanceCm(READINGS_PER_ANGLE);
     const bool targetDetected = readingShowsIntrusion(scanIndex, distanceCm);
     updatePresence(scanIndex, distanceCm);
 
@@ -326,5 +420,5 @@ void loop() {
     advanceScan();
   }
 
-  updateBuzzer(nowMs);
+  updateBuzzer(millis());
 }
