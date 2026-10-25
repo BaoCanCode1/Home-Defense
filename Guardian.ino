@@ -21,8 +21,8 @@ constexpr unsigned long REMOTE_POWER_CODE = 0xFFA25DUL;
 constexpr unsigned long REMOTE_ZERO_CODE = 0xFF6897UL;
 constexpr unsigned long REMOTE_ONE_CODE = 0xFF30CFUL;
 constexpr float SENSOR_MAX_DISTANCE_CM = 400.0;
-constexpr float PROTECTED_ZONE_DISTANCE_CM = 200.0;
-constexpr float ENTRY_MARGIN_CM = 8.0;
+constexpr float PROTECTED_ZONE_DISTANCE_CM = 400.0;
+constexpr float ENTRY_MARGIN_CM = 5.0;
 constexpr float MIN_VALID_DISTANCE_CM = 2.0;
 constexpr unsigned long ECHO_TIMEOUT_US = 26000;
 constexpr unsigned long SERVO_SETTLE_MS = 800;
@@ -39,7 +39,9 @@ constexpr byte SCAN_POINT_COUNT =
     ((SCAN_MAX_ANGLE - SCAN_MIN_ANGLE) / SCAN_STEP_ANGLE) + 1;
 constexpr byte READINGS_PER_ANGLE = 3;
 constexpr byte CALIBRATION_READINGS = 5;
+constexpr byte CALIBRATION_PASSES = 3;
 constexpr byte REQUIRED_CLEAR_SWEEPS = 1;
+constexpr uint16_t MAX_BASELINE_SAMPLE_SPREAD_CM = 25;
 
 LiquidCrystal lcd(LCD_RS_PIN, LCD_ENABLE_PIN, LCD_D4_PIN, LCD_D5_PIN,
                   LCD_D6_PIN, LCD_D7_PIN);
@@ -55,9 +57,11 @@ bool soundEnabled = true;
 bool calibrationActive = false;
 bool baselineHasEcho[SCAN_POINT_COUNT] = {};
 float baselineDistanceCm[SCAN_POINT_COUNT] = {};
+uint16_t calibrationSamplesCm[SCAN_POINT_COUNT][CALIBRATION_PASSES] = {};
 byte clearSweepCount = 0;
 byte scanIndex = 0;
 byte calibrationIndex = 0;
+byte calibrationPassIndex = 0;
 int8_t scanDirection = 1;
 bool buzzerOn = false;
 bool statusDisplayInitialized = false;
@@ -172,18 +176,26 @@ void showStatus() {
 void startCalibration() {
   calibrationActive = true;
   calibrationIndex = 0;
+  calibrationPassIndex = 0;
   scanIndex = 0;
   scanDirection = 1;
   presenceLatched = false;
   sweepHasIntrusion = false;
   clearSweepCount = 0;
+  for (byte index = 0; index < SCAN_POINT_COUNT; ++index) {
+    baselineHasEcho[index] = false;
+    baselineDistanceCm[index] = 0.0;
+    for (byte pass = 0; pass < CALIBRATION_PASSES; ++pass) {
+      calibrationSamplesCm[index][pass] = 0;
+    }
+  }
   buzzerOn = false;
   digitalWrite(BUZZER_PIN, LOW);
 
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("Calibrating...");
-  Serial.println("Keep radar area empty: calibrating 15 positions");
+  Serial.println("Keep radar area empty: calibrating 3 passes of 15 positions");
 
   radarServo.write(scanAngle(0));
   calibrationServoCommandMs = millis();
@@ -197,8 +209,10 @@ void updateCalibration(unsigned long nowMs) {
 
   const byte angle = scanAngle(calibrationIndex);
   const float distanceCm = measureFilteredDistanceCm(CALIBRATION_READINGS);
-  baselineHasEcho[calibrationIndex] = distanceCm >= 0.0;
-  baselineDistanceCm[calibrationIndex] = distanceCm;
+  if (distanceCm >= 0.0) {
+    calibrationSamplesCm[calibrationIndex][calibrationPassIndex] =
+        static_cast<uint16_t>(distanceCm + 0.5);
+  }
 
   lcd.setCursor(0, 1);
   lcd.print("Slot ");
@@ -209,16 +223,20 @@ void updateCalibration(unsigned long nowMs) {
   lcd.print(angle);
   lcd.print(" deg  ");
 
-  Serial.print("Calibration slot ");
+  Serial.print("Calibration pass ");
+  Serial.print(calibrationPassIndex + 1);
+  Serial.print("/");
+  Serial.print(CALIBRATION_PASSES);
+  Serial.print(" | slot ");
   Serial.print(calibrationIndex + 1);
   Serial.print("/15 | Angle: ");
   Serial.print(angle);
-  Serial.print(" | Saved distance: ");
-  if (baselineHasEcho[calibrationIndex]) {
-    Serial.print(baselineDistanceCm[calibrationIndex], 1);
+  Serial.print(" | Sample distance: ");
+  if (distanceCm >= 0.0) {
+    Serial.print(distanceCm, 1);
     Serial.println(" cm");
   } else {
-    Serial.println("no echo; this angle will be ignored");
+    Serial.println("no echo");
   }
 
   ++calibrationIndex;
@@ -226,6 +244,53 @@ void updateCalibration(unsigned long nowMs) {
     radarServo.write(scanAngle(calibrationIndex));
     calibrationServoCommandMs = millis();
     return;
+  }
+
+  if (calibrationPassIndex + 1 < CALIBRATION_PASSES) {
+    ++calibrationPassIndex;
+    calibrationIndex = 0;
+    radarServo.write(scanAngle(calibrationIndex));
+    calibrationServoCommandMs = millis();
+    Serial.println("Calibration pass complete; starting next pass");
+    return;
+  }
+
+  for (byte index = 0; index < SCAN_POINT_COUNT; ++index) {
+    uint16_t minimumSample = 65535;
+    uint16_t maximumSample = 0;
+    uint16_t sampleSum = 0;
+    byte validSampleCount = 0;
+    for (byte firstPass = 0; firstPass < CALIBRATION_PASSES; ++firstPass) {
+      const uint16_t sample = calibrationSamplesCm[index][firstPass];
+      if (sample == 0) {
+        continue;
+      }
+      if (sample < minimumSample) {
+        minimumSample = sample;
+      }
+      if (sample > maximumSample) {
+        maximumSample = sample;
+      }
+      sampleSum += sample;
+      ++validSampleCount;
+    }
+
+    baselineHasEcho[index] = validSampleCount >= 2 &&
+                             maximumSample - minimumSample <=
+                                 MAX_BASELINE_SAMPLE_SPREAD_CM;
+    if (baselineHasEcho[index]) {
+      baselineDistanceCm[index] =
+          static_cast<float>(sampleSum) / validSampleCount;
+    }
+    Serial.print("Baseline angle ");
+    Serial.print(scanAngle(index));
+    Serial.print(": ");
+    if (baselineHasEcho[index]) {
+      Serial.print(baselineDistanceCm[index], 1);
+      Serial.println(" cm (passes agree)");
+    } else {
+      Serial.println("unstable/no echo; angle ignored");
+    }
   }
 
   calibrationActive = false;
@@ -249,8 +314,19 @@ bool readingShowsIntrusion(byte index, float distanceCm) {
   return distanceCm <= baselineDistanceCm[index] - ENTRY_MARGIN_CM;
 }
 
-void updatePresence(byte index, float distanceCm) {
-  if (readingShowsIntrusion(index, distanceCm)) {
+bool confirmIntrusion(byte index, float firstDistanceCm) {
+  if (!readingShowsIntrusion(index, firstDistanceCm)) {
+    return false;
+  }
+
+  delay(BETWEEN_SENSOR_READINGS_MS);
+  const float confirmationDistanceCm =
+      measureFilteredDistanceCm(READINGS_PER_ANGLE);
+  return readingShowsIntrusion(index, confirmationDistanceCm);
+}
+
+void updatePresence(bool targetDetected) {
+  if (targetDetected) {
     presenceLatched = true;
     sweepHasIntrusion = true;
     clearSweepCount = 0;
@@ -404,8 +480,8 @@ void loop() {
              nowMs - lastServoCommandMs >= SERVO_SETTLE_MS) {
     const byte angle = scanAngle(scanIndex);
     const float distanceCm = measureFilteredDistanceCm(READINGS_PER_ANGLE);
-    const bool targetDetected = readingShowsIntrusion(scanIndex, distanceCm);
-    updatePresence(scanIndex, distanceCm);
+    const bool targetDetected = confirmIntrusion(scanIndex, distanceCm);
+    updatePresence(targetDetected);
 
     const bool endOfSweep =
         (scanIndex == SCAN_POINT_COUNT - 1 && scanDirection > 0) ||
